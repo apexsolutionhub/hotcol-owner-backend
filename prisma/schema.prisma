@@ -48,6 +48,25 @@ model owner_property {
   @@index([tinNumber])
 }
 
+/// Field sales people who close café/hotel deals. Optional attribution on a tenant.
+model sales_agent {
+  id          Int      @id @default(autoincrement())
+  displayName String
+  phone       String?
+  email       String?
+  /// City or coverage area (e.g. Addis Ababa, Hawassa)
+  city        String?
+  notes       String?  @db.Text
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  tenants tenant_account[]
+
+  @@index([isActive])
+  @@index([displayName])
+}
+
 model user {
   id                          Int       @id @default(autoincrement())
   UserName                    String    @unique
@@ -224,17 +243,21 @@ model tenant_account {
   bannedAt         DateTime?
   bannedReason     String?  @db.Text
   bannedByApexMemberId Int?
+  /// Optional field sales person who closed this property. Null = walk-in / unassigned.
+  salesAgentId     Int?
   createdAt        DateTime @default(now())
   updatedAt        DateTime @updatedAt
 
   suspendedBy           apex_team_member?            @relation("TenantSuspendedBy", fields: [suspendedByApexMemberId], references: [id], onDelete: SetNull)
   bannedBy              apex_team_member?            @relation("TenantBannedBy", fields: [bannedByApexMemberId], references: [id], onDelete: SetNull)
+  salesAgent            sales_agent?                 @relation(fields: [salesAgentId], references: [id], onDelete: SetNull)
   moduleChangeRequests      tenant_module_change_request[]
   orderModeChangeRequests   tenant_order_mode_change_request[]
 
   @@index([accountStatus])
   @@index([updatedAt])
   @@index([hotelDisplayName])
+  @@index([salesAgentId])
 }
 
 /// Tenant or Apex request to change subscribed modules (add/remove, repricing).
