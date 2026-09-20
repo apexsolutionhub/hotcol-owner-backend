@@ -231,6 +231,10 @@ model tenant_account {
   modules          Json?
   /// When true, cashiers may cancel unpaid live orders (Manager opt-in; default off).
   cashierCancelOrdersEnabled Boolean @default(false)
+  /// Apex opt-in: Café and Restaurant properties may use HotCol Waiter ordering.
+  waiterOrderingEnabled Boolean @default(false)
+  /// Manager/Admin opt-in: waiters may send payment-approval requests to cashiers.
+  waiterPaymentApprovalEnabled Boolean @default(false)
   /// digital | analog — café/restaurant order fulfillment
   cafeOrderMode    String   @default("digital")
   /// [{ mode, effectiveFrom, effectiveTo }] approved mode segments
@@ -427,10 +431,16 @@ model Order {
   /// Set when cashier edits table, waiter, or quantity — kitchen/bar highlight.
   orderRevisedAt     DateTime? @map("quantityRevisedAt")
   orderRevisionCount Int       @default(0)
+  /// Waiter who owns the line (HotCol Waiter portal); null for legacy/cashier-only lines.
+  waiterId    Int?
+  /// Pending payment-approval request id (waiter → cashier); null when none.
+  paymentApprovalRequestId Int?
   createdAt   DateTime @default(now())
 
   @@index([HotelName])
   @@index([HotelName, status])
+  @@index([HotelName, waiterId])
+  @@index([paymentApprovalRequestId])
 }
 
 model waiter {
@@ -441,11 +451,46 @@ model waiter {
   age          Int
   experience   Int
   phoneNumber  String
+  /// Globally unique 6-digit PIN for HotCol Waiter portal login (nullable = portal disabled).
+  passkey      String?  @unique
+  /// Manager/Admin activation — deactivated waiters cannot log in or order.
+  isActive     Boolean  @default(true)
   price        Json     @default("[]")
   tablesServed Json     @default("[]")
   payment      Json     @default("[]")
   incomeAt     Json     @default("[]")
   createdAt    DateTime @default(now())
+
+  @@index([HotelName])
+  @@index([HotelName, isActive])
+}
+
+/// Waiter → cashier payment approval request (amount + method); cashier approves/rejects.
+model waiter_payment_approval_request {
+  id              Int       @id @default(autoincrement())
+  HotelName       String
+  waiterId        Int
+  waiterName      String
+  /// Order line ids covered by this request.
+  orderIds        Json
+  tableNo         Int?
+  amountPaid      Float
+  /// Same payment method vocabulary as cashier (Cash, Bank, Credit, …).
+  paymentMethod   String
+  withBank        Boolean   @default(false)
+  /// pending | approved | rejected
+  status          String    @default("pending")
+  requestNote     String?   @db.Text
+  cashierNote     String?   @db.Text
+  resolvedByUserName String?
+  requestedAt     DateTime  @default(now())
+  resolvedAt      DateTime?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  @@index([HotelName, status])
+  @@index([HotelName, requestedAt])
+  @@index([waiterId])
 }
 
 model table {
@@ -582,6 +627,51 @@ model ItemStatus {
 
   @@index([HotelName])
   @@index([stockOutRequestId])
+}
+
+/// Live on-hand of ingredients at kitchen/bar after store stock-outs.
+/// Credited on stock-out to KITCHEN/BAR; debited when a recipe line is completed.
+model StationIngredientStock {
+  id         Int      @id @default(autoincrement())
+  HotelName  String
+  /// KITCHEN | BAR
+  station    String
+  itemName   String
+  measuredBy String   @default("")
+  unitPrice  Float    @default(0)
+  amount     Float    @default(0)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@unique([HotelName, station, itemName])
+  @@index([HotelName])
+  @@index([HotelName, station])
+}
+
+/// Audit trail: recipe ingredient qty deducted when kitchen/bar completes an order.
+model RecipeStockConsumption {
+  id              Int      @id @default(autoincrement())
+  HotelName       String
+  orderId         Int
+  menuItemTitle   String
+  /// Servings on the completed order line.
+  orderAmount     Int
+  /// KITCHEN | BAR
+  station         String
+  ingredientName  String
+  /// Total qty deducted (recipe amount × servings).
+  amount          Float
+  measuredBy      String   @default("")
+  unitPrice       Float    @default(0)
+  /// Qty that could not be covered by station on-hand (still recorded).
+  shortfallAmount Float    @default(0)
+  completedBy     String   @default("")
+  createdAt       DateTime @default(now())
+
+  @@index([HotelName])
+  @@index([HotelName, createdAt])
+  @@index([orderId])
+  @@index([HotelName, station, ingredientName])
 }
 
 /// One named leader per department per hotel (manager-maintained).
@@ -884,18 +974,21 @@ model lodging_room {
   floor              String    @default("")
   /// Nightly rate in ETB (Manager-set).
   pricePerNightETB   Float     @default(0)
-  /// vacant_dirty | occupied | vacant_clean | on_maintenance
+  /// vacant_dirty | occupied | vacant_clean | on_maintenance | reserved | inspected | out_of_order | out_of_service | blocked
   status             String    @default("vacant_clean")
-  /// When status is on_maintenance — expected ready datetime.
+  /// When status is on_maintenance — expected ready datetime (legacy; prefer statusExpectedEndAt).
   maintenanceUntil   DateTime?
+  /// Expected ready date for vacant_dirty / on_maintenance (reservation hold eligibility).
+  statusExpectedEndAt DateTime?
   notes              String    @db.Text
   createdAt          DateTime  @default(now())
   updatedAt          DateTime  @updatedAt
   createdBy          String    @default("")
   updatedBy          String    @default("")
 
-  stayRooms     lodging_stay_room[]
-  cmAssignments lodging_cm_assignment[]
+  stayRooms          lodging_stay_room[]
+  cmAssignments      lodging_cm_assignment[]
+  reservationRooms   lodging_reservation_room[]
 
   @@unique([HotelName, roomNumber])
   @@index([HotelName])
@@ -923,7 +1016,10 @@ model lodging_guest {
   createdAt       DateTime @default(now())
   updatedAt       DateTime @updatedAt
 
-  stays lodging_stay[]
+  stays         lodging_stay[]
+  reservations  lodging_reservation[]
+  complaints    lodging_guest_complaint[]
+  ratings       lodging_guest_rating[]
 
   @@index([HotelName])
   @@index([HotelName, phone])
@@ -931,37 +1027,95 @@ model lodging_guest {
   @@index([HotelName, passportNumber])
 }
 
-/// One check-in / reservation event (may span multiple rooms).
-model lodging_stay {
-  id               Int       @id @default(autoincrement())
-  HotelName        String
-  voucherCode      String
-  guestId          Int
-  /// reserved | checked_in | checked_out | cancelled
-  status           String    @default("checked_in")
-  arrivalAt        DateTime
-  /// Calendar departure date derived from arrival + nights (updated with time at checkout).
-  departureAt      DateTime
-  nights           Int       @default(1)
-  adults           Int       @default(1)
-  children         Int       @default(0)
-  preferredRoomType String   @default("")
-  notes            String    @db.Text
-  checkedInBy      String    @default("")
-  checkedOutBy     String    @default("")
-  /// Guest room portal OTP (6 digits). Unique among active stays (enforced at issue time).
-  /// Guests enter only this code — no TIN / stay id required. Cleared on checkout.
-  guestOtp         String?
-  /// Legacy hash field (unused by OTP-only portal).
-  guestOtpHash     String?
-  guestOtpIssuedAt DateTime?
-  createdAt        DateTime  @default(now())
-  updatedAt        DateTime  @updatedAt
+/// Advance booking (before check-in). Converted to lodging_stay on check-in.
+model lodging_reservation {
+  id                Int       @id @default(autoincrement())
+  HotelName         String
+  reservationCode   String
+  guestId           Int?
+  /// tentative | confirmed | cancelled | no_show | checked_in
+  status            String    @default("tentative")
+  /// walk_in | phone | website | agency | corporate | other
+  source            String    @default("phone")
+  arrivalAt         DateTime
+  departureAt       DateTime
+  nights            Int       @default(1)
+  adults            Int       @default(1)
+  children          Int       @default(0)
+  preferredRoomType String    @default("")
+  depositETB        Float     @default(0)
+  notes             String    @db.Text
+  createdBy         String    @default("")
+  updatedBy         String    @default("")
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
 
-  guest  lodging_guest       @relation(fields: [guestId], references: [id], onDelete: Restrict)
-  rooms  lodging_stay_room[]
-  bill   lodging_bill?
-  actions lodging_action_log[]
+  guest  lodging_guest?              @relation(fields: [guestId], references: [id], onDelete: SetNull)
+  rooms  lodging_reservation_room[]
+  stay   lodging_stay?
+
+  @@unique([HotelName, reservationCode])
+  @@index([HotelName])
+  @@index([HotelName, status])
+  @@index([HotelName, arrivalAt])
+  @@index([guestId])
+}
+
+model lodging_reservation_room {
+  id            Int      @id @default(autoincrement())
+  reservationId Int
+  /// Optional specific room hold (null = room-type only until check-in).
+  roomId        Int?
+  roomType      String   @default("")
+  createdAt     DateTime @default(now())
+
+  reservation lodging_reservation @relation(fields: [reservationId], references: [id], onDelete: Cascade)
+  room        lodging_room?       @relation(fields: [roomId], references: [id], onDelete: SetNull)
+
+  @@index([reservationId])
+  @@index([roomId])
+}
+
+/// One check-in / in-house stay (may span multiple rooms).
+model lodging_stay {
+  id                  Int       @id @default(autoincrement())
+  HotelName           String
+  voucherCode         String
+  guestId             Int
+  reservationId       Int?      @unique
+  /// reserved | checked_in | checked_out | cancelled
+  status              String    @default("checked_in")
+  arrivalAt           DateTime
+  /// Expected departure at check-in; updated to actual at checkout.
+  departureAt         DateTime
+  /// Expected nights entered at check-in.
+  expectedNights      Int       @default(1)
+  expectedDepartureAt DateTime?
+  /// Billable nights — provisional at check-in, finalized at checkout.
+  nights              Int       @default(1)
+  adults              Int       @default(1)
+  children            Int       @default(0)
+  preferredRoomType   String    @default("")
+  /// Frozen rate plan used for room night pricing (empty = room rack rate).
+  ratePlanId          Int?
+  ratePlanName        String    @default("")
+  notes               String    @db.Text
+  checkedInBy         String    @default("")
+  checkedOutBy        String    @default("")
+  /// Guest room portal OTP (6 digits). Unique among active stays (enforced at issue time).
+  guestOtp            String?
+  guestOtpHash        String?
+  guestOtpIssuedAt    DateTime?
+  createdAt           DateTime  @default(now())
+  updatedAt           DateTime  @updatedAt
+
+  guest       lodging_guest        @relation(fields: [guestId], references: [id], onDelete: Restrict)
+  reservation lodging_reservation? @relation(fields: [reservationId], references: [id], onDelete: SetNull)
+  rooms       lodging_stay_room[]
+  bill        lodging_bill?
+  actions     lodging_action_log[]
+  complaints  lodging_guest_complaint[]
+  ratings     lodging_guest_rating[]
 
   @@unique([HotelName, voucherCode])
   @@index([HotelName])
@@ -993,6 +1147,9 @@ model lodging_bill {
   /// open | settled | void
   status        String    @default("open")
   totalETB      Float     @default(0)
+  cashETB       Float     @default(0)
+  bankETB       Float     @default(0)
+  telebirrETB   Float     @default(0)
   settledAt     DateTime?
   settledBy     String    @default("")
   receiptNumber String    @default("")
@@ -1007,31 +1164,40 @@ model lodging_bill {
 }
 
 model lodging_bill_line {
-  id          Int      @id @default(autoincrement())
-  billId      Int
-  /// room | food_drink | laundry | other
-  kind        String
-  description String
-  quantity    Float    @default(1)
-  unitPriceETB Float   @default(0)
-  amountETB   Float    @default(0)
-  /// Room number context for split/transfer (display / matching).
-  roomNumber  String   @default("")
-  /// pending | completed | cancelled — line fulfillment (laundry by reception; F&B mirrors café Order).
-  fulfillmentStatus String @default("pending")
-  fulfilledAt DateTime?
-  fulfilledBy String   @default("")
-  createdAt   DateTime @default(now())
-  createdBy   String   @default("")
+  id                Int       @id @default(autoincrement())
+  billId            Int
+  /// room | food_drink | laundry | other | discount
+  kind              String
+  description       String
+  quantity          Float     @default(1)
+  unitPriceETB      Float     @default(0)
+  amountETB         Float     @default(0)
+  taxPercent        Float     @default(0)
+  taxETB            Float     @default(0)
+  roomNumber        String    @default("")
+  fulfillmentStatus String    @default("pending")
+  fulfilledAt       DateTime?
+  fulfilledBy       String    @default("")
+  voided            Boolean   @default(false)
+  voidedAt          DateTime?
+  voidedBy          String    @default("")
+  voidReason        String    @default("")
+  /// "" | pending | approved | rejected — discounts need Manager approval
+  approvalStatus    String    @default("")
+  approvedBy        String    @default("")
+  approvedAt        DateTime?
+  approvalNote      String    @default("")
+  createdAt         DateTime  @default(now())
+  createdBy         String    @default("")
 
   bill lodging_bill @relation(fields: [billId], references: [id], onDelete: Cascade)
 
   @@index([billId])
   @@index([kind])
   @@index([fulfillmentStatus])
+  @@index([approvalStatus])
 }
 
-/// Manager-priced laundry / F&B catalog for lodging services.
 model lodging_service_item {
   id           Int      @id @default(autoincrement())
   HotelName    String
@@ -1050,7 +1216,6 @@ model lodging_service_item {
   @@unique([HotelName, kind, name])
 }
 
-/// CM leader (or reception CM portal) assignment for cleaning / maintenance.
 model lodging_cm_assignment {
   id             Int       @id @default(autoincrement())
   HotelName      String
@@ -1074,7 +1239,6 @@ model lodging_cm_assignment {
   @@index([roomId])
 }
 
-/// Audit trail visible to Manager / Reception / CM dashboards.
 model lodging_action_log {
   id         Int      @id @default(autoincrement())
   HotelName  String
@@ -1093,6 +1257,110 @@ model lodging_action_log {
   @@index([HotelName, createdAt])
   @@index([stayId])
   @@index([actorName])
+}
+
+/// Tax percent per bill line kind (room | food_drink | laundry | other).
+model lodging_tax_config {
+  id         Int      @id @default(autoincrement())
+  HotelName  String
+  kind       String
+  taxPercent Float    @default(0)
+  updatedBy  String   @default("")
+  updatedAt  DateTime @updatedAt
+  createdAt  DateTime @default(now())
+
+  @@unique([HotelName, kind])
+  @@index([HotelName])
+}
+
+/// Manual business-day close (night audit).
+model lodging_business_day {
+  id           Int       @id @default(autoincrement())
+  HotelName    String
+  /// YYYY-MM-DD
+  businessDate String
+  /// open | closed
+  status       String    @default("open")
+  closedAt     DateTime?
+  closedBy     String    @default("")
+  summaryJson  String    @db.Text
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  @@unique([HotelName, businessDate])
+  @@index([HotelName])
+  @@index([HotelName, status])
+}
+
+/// Sellable rate plans (rack, corporate, seasonal, weekend, promo, long-stay…).
+model lodging_rate_plan {
+  id               Int      @id @default(autoincrement())
+  HotelName        String
+  name             String
+  code             String   @default("")
+  /// standard | corporate | seasonal | weekend | promo | long_stay | group | event
+  kind             String   @default("standard")
+  /// Empty = all room types.
+  roomType         String   @default("")
+  pricePerNightETB Float    @default(0)
+  /// YYYY-MM-DD inclusive; empty = no start bound
+  startDate        String   @default("")
+  /// YYYY-MM-DD inclusive; empty = no end bound
+  endDate          String   @default("")
+  minNights        Int      @default(1)
+  /// Higher wins when multiple plans match.
+  priority         Int      @default(0)
+  isActive         Boolean  @default(true)
+  notes            String   @db.Text
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+  updatedBy        String   @default("")
+
+  @@index([HotelName])
+  @@index([HotelName, isActive])
+  @@index([HotelName, kind])
+  @@unique([HotelName, name])
+}
+
+/// Guest complaint from HotCol Room portal.
+model lodging_guest_complaint {
+  id         Int      @id @default(autoincrement())
+  HotelName  String
+  stayId     Int
+  guestId    Int?
+  category   String   @default("general")
+  message    String   @db.Text
+  /// open | acknowledged | resolved
+  status     String   @default("open")
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  stay  lodging_stay   @relation(fields: [stayId], references: [id], onDelete: Cascade)
+  guest lodging_guest? @relation(fields: [guestId], references: [id], onDelete: SetNull)
+
+  @@index([HotelName])
+  @@index([HotelName, status])
+  @@index([stayId])
+}
+
+/// Guest stay rating from HotCol Room portal (one per stay).
+model lodging_guest_rating {
+  id          Int      @id @default(autoincrement())
+  HotelName   String
+  stayId      Int      @unique
+  guestId     Int?
+  overall     Int
+  cleanliness Int?
+  service     Int?
+  comment     String   @db.Text
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  stay  lodging_stay   @relation(fields: [stayId], references: [id], onDelete: Cascade)
+  guest lodging_guest? @relation(fields: [guestId], references: [id], onDelete: SetNull)
+
+  @@index([HotelName])
+  @@index([stayId])
 }
 
 // =============================================================================
@@ -1415,4 +1683,54 @@ model hr_incident {
 
   @@index([HotelName])
   @@index([employeeId])
+}
+
+/// Canonical crystal (catalyst) product names for inventory / recipe / purchase selectors.
+/// Global catalog (not hotel-scoped): Amharic | Romanized | English.
+model CrystalName {
+  id        Int      @id @default(autoincrement())
+  /// Amharic script segment (e.g. ዳቦ)
+  amharic   String   @db.VarChar(255)
+  /// Romanized Amharic segment (e.g. Dabo) — not Latin-as-a-language
+  romanized String   @db.VarChar(255)
+  /// English meaning segment (e.g. Bread)
+  english   String   @db.VarChar(255)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([amharic, romanized, english], name: "crystal_name_triple_unique")
+  @@index([amharic])
+  @@index([romanized])
+  @@index([english])
+  @@map("crystal_name")
+}
+
+/// Tenant-proposed crystal names awaiting Apex review (Phase 1 — no AI yet).
+/// Staff can use the proposed label immediately; Apex merges or approves as new.
+model CrystalNameProposal {
+  id           Int      @id @default(autoincrement())
+  /// Original typed / free text from the property
+  rawText      String   @db.VarChar(512)
+  amharic      String   @db.VarChar(255)
+  romanized    String   @db.VarChar(255)
+  english      String   @db.VarChar(255)
+  /// pending | approved | merged | rejected
+  status       String   @default("pending") @db.VarChar(32)
+  /// registration | purchase | recipe | other
+  source       String   @default("other") @db.VarChar(64)
+  HotelName    String?  @db.VarChar(255)
+  tinNumber    String?  @db.VarChar(64)
+  proposedBy   String?  @db.VarChar(255)
+  /// Set when merged into an existing CrystalName.id
+  mergedIntoId Int?
+  reviewNote   String?  @db.VarChar(512)
+  reviewedBy   String?  @db.VarChar(255)
+  reviewedAt   DateTime?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@index([status, createdAt])
+  @@index([amharic, romanized, english])
+  @@index([tinNumber])
+  @@map("crystal_name_proposal")
 }
