@@ -1482,6 +1482,14 @@ model hr_employee {
   portalOtpIssuedAt DateTime?
   portalFirstLoginAt DateTime?
   profileImageUrl String    @default("")
+  /// Phase B profile extensions
+  gender          String    @default("")
+  education       String    @default("")
+  personalTin     String    @default("")
+  /// Years of experience (0 = not set)
+  yearsExperience Int       @default(0)
+  /// VARCHAR so MySQL can default existing employee rows to ""
+  medicalNote     String    @default("") @db.VarChar(4000)
   createdAt       DateTime  @default(now())
   updatedAt       DateTime  @updatedAt
 
@@ -1494,6 +1502,9 @@ model hr_employee {
   incidents       hr_incident[]
   capabilities    hr_employee_capability[]
   otpResetRequests hr_otp_reset_request[]
+  salaryHistory   hr_salary_history[]
+  checklistRuns   hr_checklist_run[]
+  overtimeRequests hr_overtime_request[]
   team            hr_team?  @relation(fields: [teamId], references: [id], onDelete: SetNull)
 
   @@index([HotelName])
@@ -1759,8 +1770,17 @@ model hr_payroll_line_rule {
   amountETB  Float    @default(0)
   /// always | day_range
   whenMode   String   @default("always")
+  /// Legacy day-of-month (kept for older rows)
   fromDay    Int?
   toDay      Int?
+  /// Calendar activation window when whenMode = day_range (YYYY-MM-DD)
+  fromYmd    String   @default("")
+  toYmd      String   @default("")
+  /// When true, % applies only if salary is in [fromAmountETB, toAmountETB)
+  customized Boolean  @default(false)
+  fromAmountETB Float @default(0)
+  /// Null / omit = no upper bound
+  toAmountETB Float?
   active     Boolean  @default(true)
   sortOrder  Int      @default(0)
   createdAt  DateTime @default(now())
@@ -2170,4 +2190,370 @@ model ats_application {
   @@index([tinNumber, status])
   @@index([vacancyId])
   @@index([HotelName])
+}
+
+// =============================================================================
+// HR PHASE B+
+// =============================================================================
+
+/// Hotel-defined tax / pension band (one matching band × full salary).
+model hr_payroll_stat_band {
+  id          Int      @id @default(autoincrement())
+  HotelName   String
+  /// tax | pension
+  kind        String
+  label       String   @default("")
+  /// Percent applied to full matching salary (0–100)
+  ratePercent Float    @default(0)
+  fromETB     Float    @default(0)
+  /// Null / omit = no upper bound (salary >= fromETB)
+  toETB       Float?
+  /// always | date_range
+  effectiveMode String @default("always")
+  fromYmd     String   @default("")
+  toYmd       String   @default("")
+  active      Boolean  @default(true)
+  sortOrder   Int      @default(0)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([HotelName])
+  @@index([HotelName, kind])
+}
+
+model hr_salary_history {
+  id            Int      @id @default(autoincrement())
+  HotelName     String
+  employeeId    Int
+  previousETB   Float    @default(0)
+  newETB        Float
+  reason        String   @default("")
+  changedBy     String   @default("")
+  /// pending | approved | rejected | applied
+  status        String   @default("applied")
+  decidedBy     String   @default("")
+  decidedAt     DateTime?
+  createdAt     DateTime @default(now())
+
+  employee hr_employee @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+
+  @@index([HotelName])
+  @@index([employeeId])
+}
+
+model hr_advance_request {
+  id          Int      @id @default(autoincrement())
+  HotelName   String
+  employeeId  Int
+  amountETB   Float
+  reason      String   @db.Text
+  /// pending | approved | rejected | paid
+  status      String   @default("pending")
+  requestedBy String   @default("")
+  decidedBy   String   @default("")
+  decidedAt   DateTime?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([HotelName])
+  @@index([HotelName, status])
+  @@index([employeeId])
+}
+
+model hr_loan {
+  id              Int      @id @default(autoincrement())
+  HotelName       String
+  employeeId      Int
+  principalETB    Float
+  remainingETB    Float
+  installmentETB  Float    @default(0)
+  reason          String   @db.Text
+  /// pending | active | rejected | closed
+  status          String   @default("pending")
+  createdBy       String   @default("")
+  decidedBy       String   @default("")
+  decidedAt       DateTime?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@index([HotelName])
+  @@index([employeeId])
+}
+
+model hr_bonus {
+  id          Int      @id @default(autoincrement())
+  HotelName   String
+  employeeId  Int
+  label       String
+  amountETB   Float
+  /// pending | approved | rejected | paid
+  status      String   @default("pending")
+  createdBy   String   @default("")
+  decidedBy   String   @default("")
+  decidedAt   DateTime?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([HotelName])
+  @@index([employeeId])
+}
+
+model hr_overtime_request {
+  id           Int      @id @default(autoincrement())
+  HotelName    String
+  employeeId   Int
+  workYmd      String
+  hours        Float    @default(0)
+  amountETB    Float    @default(0)
+  reason       String   @db.Text
+  /// pending | approved | rejected | paid
+  status       String   @default("pending")
+  requestedBy  String   @default("")
+  decidedBy    String   @default("")
+  decidedAt    DateTime?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  employee hr_employee @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+
+  @@index([HotelName])
+  @@index([employeeId])
+}
+
+model hr_shift_template {
+  id          Int      @id @default(autoincrement())
+  HotelName   String
+  code        String
+  name        String
+  department  String   @default("")
+  startTime   String   @default("")
+  endTime     String   @default("")
+  /// JSON weekday flags e.g. [1,2,3,4,5]
+  weekdayJson String   @db.Text
+  notes       String   @default("")
+  active      Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@unique([HotelName, code])
+  @@index([HotelName])
+}
+
+model hr_checklist_template {
+  id          Int      @id @default(autoincrement())
+  HotelName   String
+  /// onboarding | exit
+  kind        String
+  name        String
+  active      Boolean  @default(true)
+  /// When true, matching employees are expected to complete this checklist
+  required    Boolean  @default(true)
+  /// Department code; empty = all departments
+  department  String   @default("")
+  /// Job title / position; empty = all positions
+  jobTitle    String   @default("")
+  /// Optional team under department; null = any team
+  teamId      Int?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  items hr_checklist_template_item[]
+  runs  hr_checklist_run[]
+
+  @@index([HotelName, kind])
+  @@index([HotelName, department])
+  @@index([teamId])
+}
+
+model hr_checklist_template_item {
+  id           Int      @id @default(autoincrement())
+  templateId   Int
+  label        String
+  required     Boolean  @default(true)
+  /// HR | Store | IT | Finance | Manager
+  defaultOwner String   @default("HR")
+  sortOrder    Int      @default(0)
+
+  template hr_checklist_template @relation(fields: [templateId], references: [id], onDelete: Cascade)
+
+  @@index([templateId])
+}
+
+model hr_checklist_run {
+  id           Int      @id @default(autoincrement())
+  HotelName    String
+  templateId   Int
+  employeeId   Int
+  kind         String
+  /// open | completed | awaiting_manager | closed
+  status       String   @default("open")
+  completedAt  DateTime?
+  decidedBy    String   @default("")
+  decidedAt    DateTime?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  template hr_checklist_template @relation(fields: [templateId], references: [id], onDelete: Cascade)
+  employee hr_employee           @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  items    hr_checklist_run_item[]
+
+  @@index([HotelName])
+  @@index([employeeId])
+}
+
+model hr_checklist_run_item {
+  id          Int       @id @default(autoincrement())
+  runId       Int
+  label       String
+  required    Boolean   @default(true)
+  ownerRole   String    @default("HR")
+  done        Boolean   @default(false)
+  completedBy String    @default("")
+  completedAt DateTime?
+  note        String    @default("")
+  sortOrder   Int       @default(0)
+
+  run hr_checklist_run @relation(fields: [runId], references: [id], onDelete: Cascade)
+
+  @@index([runId])
+}
+
+/// HR documentation library (not per-employee). HR uploads; HR+Manager list/download.
+model hr_library_document {
+  id                 Int      @id @default(autoincrement())
+  HotelName          String
+  title              String
+  description        String   @db.Text
+  fileSecureUrl      String   @default("") @db.VarChar(2048)
+  filePublicId       String   @default("")
+  fileBytes          Int      @default(0)
+  fileFormat         String   @default("")
+  fileOriginalName   String   @default("")
+  uploadedBy         String   @default("")
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  @@index([HotelName])
+}
+
+model hr_career_action {
+  id          Int      @id @default(autoincrement())
+  HotelName   String
+  employeeId  Int
+  /// promotion | transfer
+  kind        String
+  detail      String   @db.Text
+  fromDept    String   @default("")
+  toDept      String   @default("")
+  fromTitle   String   @default("")
+  toTitle     String   @default("")
+  /// target team applied on Manager approve (null = keep current team)
+  toTeamId    Int?
+  /// leader | employee (applied on Manager approve)
+  toOrgPosition String @default("employee")
+  /// pending | approved | rejected | applied
+  status      String   @default("pending")
+  createdBy   String   @default("")
+  decidedBy   String   @default("")
+  decidedAt   DateTime?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([HotelName])
+  @@index([employeeId])
+}
+
+model hr_disciplinary_action {
+  id          Int      @id @default(autoincrement())
+  HotelName   String
+  employeeId  Int
+  title       String
+  detail      String   @db.Text
+  /// pending | approved | rejected | recorded
+  status      String   @default("pending")
+  createdBy   String   @default("")
+  decidedBy   String   @default("")
+  decidedAt   DateTime?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([HotelName])
+  @@index([employeeId])
+}
+
+model hr_performance_review {
+  id          Int      @id @default(autoincrement())
+  HotelName   String
+  employeeId  Int
+  periodLabel String   @default("")
+  rating      String   @default("")
+  summary     String   @db.Text
+  /// draft | pending | finalized | rejected
+  status      String   @default("draft")
+  createdBy   String   @default("")
+  decidedBy   String   @default("")
+  decidedAt   DateTime?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([HotelName])
+  @@index([employeeId])
+}
+
+model hr_training_assignment {
+  id          Int      @id @default(autoincrement())
+  HotelName   String
+  employeeId  Int
+  title       String
+  detail      String   @db.Text
+  dueYmd      String   @default("")
+  /// pending | approved | rejected | completed
+  status      String   @default("pending")
+  createdBy   String   @default("")
+  decidedBy   String   @default("")
+  decidedAt   DateTime?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([HotelName])
+  @@index([employeeId])
+}
+
+model hr_benefit_assignment {
+  id          Int      @id @default(autoincrement())
+  HotelName   String
+  employeeId  Int
+  /// meal | housing | transport | other
+  kind        String
+  label       String
+  amountETB   Float    @default(0)
+  /// pending | approved | rejected | active | ended
+  status      String   @default("pending")
+  createdBy   String   @default("")
+  decidedBy   String   @default("")
+  decidedAt   DateTime?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([HotelName])
+  @@index([employeeId])
+}
+
+model hr_asset {
+  id          Int      @id @default(autoincrement())
+  HotelName   String
+  employeeId  Int?
+  label       String
+  serialNo    String   @default("")
+  /// available | issued | returned | lost
+  status      String   @default("available")
+  issuedYmd   String   @default("")
+  returnedYmd String   @default("")
+  notes       String   @db.Text
+  createdBy   String   @default("")
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([HotelName])
+  @@index([employeeId])
 }
